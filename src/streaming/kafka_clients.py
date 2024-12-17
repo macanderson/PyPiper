@@ -20,12 +20,6 @@ from src.streaming.kafka_data import streaming_data
 
 @dotenv(filename='.env')
 class KafkaSettings:
-    """Configuration settings for Kafka.
-
-    Summary:
-        Configuration settings for Kafka.
-
-    Attributes:
         bootstrap_servers: str
         schema_registry_url: str
         schema_registry_auth_info: str
