@@ -20,3 +20,8 @@ __pycache__
 logs/
 .vscode*
 .mypy_cache/
+dist/
+build/
+*.egg-info/
+secrets/
+.secrets/
