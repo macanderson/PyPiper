@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, date, time, timedelta
-from decimal import Decimal, DecimalException, getcontext, ROUND_HALF_EVEN
+from decimal import Decimal, DecimalException, getcontext, ROUND_HALF_EVEN, InvalidOperation
 from typing import (
     Any,
     Dict,
@@ -16,6 +16,7 @@ from typing import (
 )
 from typing import Any, Dict, Type
 from enum import Enum
+import logging
 
 import attrs
 
@@ -251,7 +252,7 @@ class SchemaField:
     def __attrs_post_init__(self) -> None:
         pass
 
-    def __call__(self) -> attrs.field:
+    def __call__(self) -> attrs.Field:
         """
         Return an attrs field with proper metadata and (Python -> Avro) converter.
         """
@@ -599,19 +600,32 @@ def AvroModel(cls: Type[T]) -> Type[AvroSchema]:
 
 
 def schema(cls: Type[T]) -> Type[AvroSchema]:
-    """
-    Decorator that transforms a class into an attrs-defined class with
-    additional Avro schema/serde methods for Flink round-trip.
+    """Decorate classes with `@schema` to enable flink/kafka round-trip.
+
+    Properties:
+        - schema_dict: Dict[str, Any]
+            The dictionary representation of the schema generated from attrs fields.
+        - schema_str: str (json.dumps(schema_dict)).
+            The json string representation of the schema_dict.
+        - schema: Schema (from confluent_kafka)
+            The confluent kafka schema object representation of the schema_str.
+
+    Methods:
+        - to_dict: Dict[str, Any]
+        - from_dict: Any
+        - to_bytes: bytes
+        - from_bytes: Any
     """
     cls = attrs.define(cls)
     if not hasattr(cls, "SchemaConfig"):
         cls.SchemaConfig = SchemaConfig()  # type: ignore
     cls.SchemaConfig._type = "avro"  # type: ignore
 
-    # Dynamically build Avro schema
+    # Ensure schema_dict is generated before accessing schema_str
     cls.schema_dict = property(lambda self: generate_avro_schema(cls))  # type: ignore
     cls.schema_str = property(lambda self: json.dumps(self.schema_dict))  # type: ignore
-    cls.schema = property(lambda self: Schema(self.schema_str, "AVRO"))
+    cls.schema = property(lambda self: Schema(self.schema_str, "AVRO"))  # type: ignore
+
     # Convert to dictionary (Python object -> "plain" dict),
     # storing date/time/datetime as numeric where relevant.
     def to_dict(self_: Any, *args, **kwargs) -> Dict[str, Any]:
@@ -621,30 +635,32 @@ def schema(cls: Type[T]) -> Type[AvroSchema]:
             lt = f.metadata.get("logicalType")
             if val is None:
                 out[f.name] = None
-            elif lt == "timestamp-millis" or lt == "local-timestamp-millis":
+            elif lt in ("timestamp-millis", "local-timestamp-millis"):
                 # store as ms since epoch
                 if isinstance(val, datetime):
-                    out[f.name] = python_datetime_to_millis(val)
+                    out[f.name] = int(val.timestamp() * 1000)  # Convert to ms
                 else:
-                    out[f.name] = val
+                    out[f.name] = int(val)  # Ensure conversion to int
             elif lt == "time-millis":
                 # store as ms since midnight
                 if isinstance(val, time):
-                    out[f.name] = python_time_to_millis(val)
+                    out[f.name] = (val.hour * 3600000 + 
+                                   val.minute * 60000 + 
+                                   val.second * 1000 + 
+                                   val.microsecond // 1000)
                 else:
-                    out[f.name] = val
+                    out[f.name] = int(val)  # Ensure conversion to int
             elif lt == "date":
                 if isinstance(val, date):
                     out[f.name] = python_date_to_days(val)
                 else:
-                    out[f.name] = val
+                    out[f.name] = int(val)  # Ensure conversion to int
             elif lt == "enum":
                 # If we truly want Avro enumerations, store the name
                 if isinstance(val, Enum):
-                    out[f.name] = val.name
+                    out[f.name] = val.value.lower() if isinstance(val.value, str) else val.name.lower()
                 else:
-                    out[f.name] = str(val)
-            else:
+                    out[f.name] = str(val).lower()
                 # fallback
                 if isinstance(val, Enum):
                     # By default, store enum as its name
@@ -653,26 +669,35 @@ def schema(cls: Type[T]) -> Type[AvroSchema]:
                     out[f.name] = val
         return out
 
-    cls.to_dict = to_dict  # Assign the to_dict method to the class
+    cls.to_dict = to_dict  # type: ignore
 
     # from_dict for easy structure
     def from_dict(cls_, data: Dict[str, Any]) -> Any:
-        # We'll run a post-processing step if we see date/time/datetime
-        # to convert from numeric to python objects
+        """Convert a dictionary to an instance of the class.
+
+        This method processes date/time/datetime fields to convert from
+        numeric representations back to Python objects.
+
+        Args:
+            data (Dict[str, Any]) : The dictionary containing field values.
+
+        Returns:
+            Any : An instance of the class populated with the provided data.
+        """
         def structure_converter(val: Any, field) -> Any:
             lt = field.metadata.get("logicalType")
             if lt in ("timestamp-millis", "local-timestamp-millis"):
                 if val is None:
                     return None
-                return millis_to_python_datetime(val)
+                return millis_to_python_datetime(val)  # Convert to datetime
             elif lt == "time-millis":
                 if val is None:
                     return None
-                return millis_to_python_time(val)
+                return millis_to_python_time(val)  # Convert to time
             elif lt == "date":
                 if val is None:
                     return None
-                return days_to_python_date(val)
+                return days_to_python_date(val)  # Convert to date
             elif lt == "enum":
                 # If we want to parse to an actual Enum:
                 enum_symbols = field.metadata.get("symbols")
@@ -700,16 +725,28 @@ def schema(cls: Type[T]) -> Type[AvroSchema]:
 
         return cls_(**structured_data)
 
-    cls.from_dict = classmethod(from_dict)  # Assign from_dict as a class method
+    cls.from_dict = classmethod(from_dict)  # type: ignore
     
     # to_bytes / from_bytes using Confluent Avro
     def to_bytes(self_, registry_client: SchemaRegistryClient, subject: str) -> bytes:
         """
         Convert this instance into Avro-serialized bytes using Confluent AvroSerializer.
-        Ensuring date/time/datetime are numeric.
+        Ensuring date/time/datetime are numeric and decimals are written as 
+        big endian byte arrays.
+
+        Args:
+            registry_client (SchemaRegistryClient) : The schema registry client.
+            subject (str) : The subject name for the schema.
+
+        Returns:
+            bytes : The Avro-serialized byte representation of the instance.
+
+        Raises:
+            ValueError : If no Avro schema is found.
         """
-        schema_dict = generate_avro_schema(cls)
+        schema_dict = generate_avro_schema(self_.__class__)
         if not schema_dict:
+            logger.error("No Avro schema found.")
             raise ValueError("No Avro schema found.")
         schema_str = json.dumps(schema_dict)
 
@@ -717,13 +754,30 @@ def schema(cls: Type[T]) -> Type[AvroSchema]:
             schema_registry_client=registry_client,
             schema_str=schema_str,
         )
+        
+        data_dict = self_.to_dict()
+        for key, field in attrs.fields(self_.__class__):
+            value = getattr(self_, field.name)
+            if isinstance(value, Decimal):
+                metadata = field.metadata
+                precision = metadata.get('precision')
+                scale = metadata.get('scale')
+                if precision is None or scale is None:
+                    logger.error("Precision or scale not defined for decimal field.")
+                    raise ValueError("Precision or scale not defined for decimal field.")
+                try:
+                    data_dict[key] = decimal_to_bytes(value, precision, scale)
+                except ValueError as e:
+                    logger.error(f"Failed to convert decimal for field {field.name}: {e}")
+                    raise
+
         serialized = avro_serializer(
-            self_.to_dict(),
+            data_dict,
             SerializationContext(topic=subject, field=MessageField.VALUE),
         )
         return serialized
 
-    cls.to_bytes = to_bytes
+    cls.to_bytes = to_bytes  # type: ignore
 
     def from_bytes(cls_, data: bytes, registry_client: SchemaRegistryClient, subject: str) -> Any:
         """
@@ -745,9 +799,33 @@ def schema(cls: Type[T]) -> Type[AvroSchema]:
         )
         return result
 
-    cls.from_bytes = classmethod(from_bytes)
+    cls.from_bytes = classmethod(from_bytes)  # type: ignore
 
-    return cls
+    return cls  # type: ignore
 
 
+def decimal_to_bytes(value: Decimal, precision: int, scale: int) -> bytes:
+    """
+    Convert a Decimal value to a byte array in big endian format, respecting the specified precision and scale.
+
+    Args:
+        value (Decimal): The Decimal value to convert.
+        precision (int): The total number of digits that the Decimal number can contain.
+        scale (int): The number of digits to the right of the decimal point.
+
+    Returns:
+        bytes: The byte array representation of the Decimal.
+
+    Raises:
+        ValueError: If the Decimal value does not conform to the specified precision and scale.
+    """
+    try:
+        quantized_value = value.quantize(Decimal(f'1e-{scale}'))
+        if len(quantized_value.as_tuple().digits) > precision:
+            raise ValueError(f"Decimal value {value} exceeds precision {precision} and scale {scale}")
+        # Convert to a big endian byte array
+        return quantized_value.to_integral_value().to_bytes((quantized_value.adjusted() + 1 + 3) // 4, byteorder='big', signed=True)
+    except InvalidOperation as e:
+        logger.error(f"Error converting decimal: {e}")
+        raise ValueError(f"Error in decimal conversion for value {value} with precision {precision} and scale {scale}: {e}")
 

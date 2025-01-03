@@ -1,16 +1,15 @@
-"""
-App class for Kafka producer and consumer.
-"""
-from typing import Optional, Callable, Literal
+"""App class for Kafka producer and consumer."""
+from typing import Optional, Callable, Literal, Any, Dict
 
 import attrs
 import logging
 
 from confluent_kafka import SerializingProducer, DeserializingConsumer
 from confluent_kafka.serialization import (
-    StringSerializer, IntegerSerializer, DoubleSerializer, 
+    StringSerializer, IntegerSerializer, DoubleSerializer,
     StringDeserializer, IntegerDeserializer, DoubleDeserializer
 )
+
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer, AvroDeserializer
 from confluent_kafka.admin import AdminClient
@@ -18,13 +17,30 @@ from confluent_kafka.admin import AdminClient
 from src.stream.models.schema import AvroSchema, AvroModel
 from src.stream.config.settings import Settings
 
-settings = Settings()
-KeyType = Literal['string', 'integer', 'double'] | None
 
-logger = logging.getLogger('Tradesignals-io.stream.app')
+# --- Setup Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    encoding='utf-8',
+    filename='app.log',
+    filemode='a',
+)
+
+"""Import Settings loaded from a .env file."""
+settings = Settings()
+
+# Custom type kafka message key field serializer types
+KeySerializerType = Literal['string', 'integer', 'double'] | None
+# Custom type for kafka message value field serializer types
+ValueSerializerType = Literal['avro', 'string', 'integer', 'double'] | None
+
+# 
+logger = logging.getLogger(__name__)
 
 @attrs.define
-class App:
+class Pipeline:
     """Producer for Avro using settings for authentication.
 
     Summary:
@@ -35,23 +51,20 @@ class App:
         schema_registry_client: SchemaRegistryClient
         admin_client: AdminClient
     """
-    name: str
-    writer: AvroSchema
-    producer: SerializingProducer
-    admin_client: AdminClient
-    schema_registry_client: SchemaRegistryClient
-    enable_auto_commit: Optional[bool] = True
-    key_type: Optional[KeyType] = 'string'
-    consumer: Optional[DeserializingConsumer] = None
-    consumer_group_id: Optional[str] = 'tradesignals-io'
-    auto_commit_interval_ms: Optional[int] = 100
-    auto_offset_reset: Optional[str] = 'earliest'
-    stats_cb: Optional[Callable] = lambda stats: logger.info(stats)
-    error_cb: Optional[Callable] = lambda err: logger.error(err)
-    delivery_cb: Optional[Callable] = lambda msg: logger.info(msg)
-    reader: Optional[AvroModel] = None
-
-
+    id: str
+    input_type: Literal['custom']
+    input_name: str
+    input_schema: Optional[AvroSchema]
+    output_type: Literal['kafka', 'flink', 'kafka_connect', 'custom']
+    output_name: str
+    output_schema: Optional[AvroSchema]
+    producer: Optional[SerializingProducer]
+    producer_conf: Optional[Dict[str, Any]]
+    consumer: Optional[DeserializingConsumer]
+    schema_registry_client: Optional[SchemaRegistryClient]
+    error_cb: Optional[Callable]
+    delivery_cb: Optional[Callable]
+    is_running: bool = False
 
     def __init__(
             self,
