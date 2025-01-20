@@ -14,6 +14,9 @@ logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 logger.addHandler(logging.FileHandler('./logs/log.txt'))
 
+__all__ = ['TestOutput', '__version_info__', '__version__']
+
+
 @schema
 class TestOutput(AvroSchema):
     name: str = SchemaField(default='joe blow')()
